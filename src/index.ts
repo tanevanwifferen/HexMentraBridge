@@ -22,8 +22,9 @@ const deviceAuth: { deviceId: string; publicKeyBase64url: string; privateKeyPkcs
 function buildDeviceAuthPayload(params: {
   deviceId: string; clientId: string; clientMode: string;
   role: string; scopes: string[]; signedAtMs: number; token: string;
+  nonce?: string;
 }): string {
-  return ['v1', params.deviceId, params.clientId, params.clientMode, params.role, params.scopes.join(','), String(params.signedAtMs), params.token].join('|');
+  return ['v2', params.deviceId, params.clientId, params.clientMode, params.role, params.scopes.join(','), String(params.signedAtMs), params.token, params.nonce ?? ''].join('|');
 }
 
 function signDevicePayload(payload: string): string {
@@ -278,42 +279,69 @@ class OpenClawClient {
       }
 
       this.ws.on('open', () => {
-        const connId = this.nextId();
-        this.send({
-          type: 'req', id: connId, method: 'connect',
-          params: {
-            minProtocol: 3, maxProtocol: 3,
-            client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.9.0', platform: 'linux', mode: 'cli' },
-            role: 'operator',
-            scopes: ['operator.read', 'operator.write'],
-            auth: { token: deviceAuth?.deviceToken || OPENCLAW_GW_TOKEN },
-            ...(deviceAuth ? (() => {
-              const signedAt = Date.now();
-              const payload = buildDeviceAuthPayload({
-                deviceId: deviceAuth.deviceId,
-                clientId: 'gateway-client', clientMode: 'cli',
-                role: 'operator', scopes: ['operator.read', 'operator.write'],
-                signedAtMs: signedAt, token: deviceAuth.deviceToken || OPENCLAW_GW_TOKEN,
-              });
-              return { device: { id: deviceAuth.deviceId, publicKey: deviceAuth.publicKeyBase64url, signature: signDevicePayload(payload), signedAt } };
-            })() : {}),
-          },
-        });
-        const handler = (data: any) => {
-          const msg = JSON.parse(String(data));
-          if (msg.type === 'res' && msg.id === connId) {
-            if (msg.ok) {
-              this.connected = true;
-              this.reconnectDelay = RECONNECT_DELAY_MS;
-              console.log('[OpenClaw] Connected');
-              resolve();
-            } else {
-              reject(new Error(`Connect failed: ${JSON.stringify(msg.error)}`));
+        // New protocol: wait for connect.challenge event with nonce before sending connect
+        const sendConnect = (nonce?: string) => {
+          const connId = this.nextId();
+          const deviceBlock = deviceAuth ? (() => {
+            const signedAt = Date.now();
+            const payload = buildDeviceAuthPayload({
+              deviceId: deviceAuth.deviceId,
+              clientId: 'gateway-client', clientMode: 'cli',
+              role: 'operator', scopes: ['operator.read', 'operator.write'],
+              signedAtMs: signedAt, token: deviceAuth.deviceToken || OPENCLAW_GW_TOKEN,
+              nonce: nonce || '',
+            });
+            return { device: { id: deviceAuth.deviceId, publicKey: deviceAuth.publicKeyBase64url, signature: signDevicePayload(payload), signedAt, ...(nonce ? { nonce } : {}) } };
+          })() : (nonce ? { device: { nonce } } : {});
+          this.send({
+            type: 'req', id: connId, method: 'connect',
+            params: {
+              minProtocol: 3, maxProtocol: 3,
+              client: { id: 'gateway-client', displayName: 'G1 Bridge', version: '0.9.0', platform: 'linux', mode: 'cli' },
+              role: 'operator',
+              scopes: ['operator.read', 'operator.write'],
+              auth: { token: deviceAuth?.deviceToken || OPENCLAW_GW_TOKEN },
+              ...deviceBlock,
+            },
+          });
+          const handler = (data: any) => {
+            const msg = JSON.parse(String(data));
+            if (msg.type === 'res' && msg.id === connId) {
+              if (msg.ok) {
+                this.connected = true;
+                this.reconnectDelay = RECONNECT_DELAY_MS;
+                console.log('[OpenClaw] Connected');
+                resolve();
+              } else {
+                reject(new Error(`Connect failed: ${JSON.stringify(msg.error)}`));
+              }
+              this.ws!.removeListener('message', handler);
             }
-            this.ws!.removeListener('message', handler);
-          }
+          };
+          this.ws!.on('message', handler);
         };
-        this.ws!.on('message', handler);
+
+        // Listen for challenge event; fall back to immediate connect after 2s
+        let challengeReceived = false;
+        const challengeTimeout = setTimeout(() => {
+          if (!challengeReceived) {
+            console.log('[OpenClaw] No challenge received, connecting without nonce');
+            sendConnect();
+          }
+        }, 2000);
+        const challengeHandler = (data: any) => {
+          try {
+            const msg = JSON.parse(String(data));
+            if (msg.type === 'event' && msg.event === 'connect.challenge' && msg.payload?.nonce) {
+              challengeReceived = true;
+              clearTimeout(challengeTimeout);
+              this.ws!.removeListener('message', challengeHandler);
+              console.log('[OpenClaw] Challenge received, connecting with nonce');
+              sendConnect(msg.payload.nonce);
+            }
+          } catch {}
+        };
+        this.ws!.on('message', challengeHandler);
       });
 
       this.ws.on('message', (data) => {
@@ -458,7 +486,8 @@ class OpenClawClient {
           for (const [runId, listener] of this.runListeners) {
             if (listener === cb) { this.runListeners.delete(runId); break; }
           }
-          done('Hex braucht zu lange.');
+          console.log('[OpenClaw] Hard timeout reached — suppressing stale request');
+          done('');
         }
       }, HARD_TIMEOUT_MS);
     });
