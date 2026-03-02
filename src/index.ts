@@ -413,6 +413,7 @@ class OpenClawClient {
 
       this.ws.on('close', () => {
         console.log('[OpenClaw] WS closed');
+        const wasConnected = this.connected;
         this.connected = false;
         for (const [id, p] of this.pending) {
           p.reject(new Error('WS closed'));
@@ -421,6 +422,10 @@ class OpenClawClient {
         this._pendingIdempotencyCallbacks.clear();
         this.runListeners.clear();
         this.scheduleReconnect();
+        // If we never connected, reject the initial connect() promise so main() continues
+        if (!wasConnected) {
+          reject(new Error('WS closed before connect'));
+        }
       });
     });
   }
