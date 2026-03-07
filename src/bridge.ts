@@ -204,7 +204,7 @@ export class G1OpenClawBridge extends AppServer {
         return;
       }
 
-      const manualPatterns = ['manual mode', 'manueller modus'];
+      const manualPatterns = ['manual mode', 'manuel mode', 'manueller modus'];
       const autoPatterns = ['automatic mode', 'automatischer modus', 'auto mode'];
       if (manualPatterns.some(p => normalized === p)) {
         manualMode = true;
